@@ -616,8 +616,196 @@ def check_ssl(url):
         results.append({"name": "SSL Error", "severity": "medium", "detail": str(e)[:120], "evidence": str(e)[:80]})
     return results
 
+
+def check_cors(url):
+    """Detect CORS misconfigurations"""
+    results = []
+    evil_origin = "https://evil-cors-test.com"
+    r = safe_request(url, headers={"Origin": evil_origin})
+    if not r:
+        return results
+    acao = r.headers.get("Access-Control-Allow-Origin", "")
+    acac = r.headers.get("Access-Control-Allow-Credentials", "")
+    if acao == "*":
+        results.append({
+            "name": "CORS Misconfiguration (Wildcard)",
+            "severity": "medium",
+            "detail": "Access-Control-Allow-Origin: * — أي موقع يقدر يقرأ الردود",
+            "evidence": f"ACAO: {acao}",
+            "payload": evil_origin
+        })
+    elif acao == evil_origin:
+        sev = "high" if acac.lower() == "true" else "medium"
+        results.append({
+            "name": "CORS Misconfiguration (Origin Reflection)",
+            "severity": sev,
+            "detail": f"السيرفر بيعكس أي Origin{(' مع Credentials' if acac.lower()=='true' else '')}",
+            "evidence": f"ACAO: {acao} | ACAC: {acac}",
+            "payload": evil_origin
+        })
+    return results
+
+
+def check_info_disclosure(url):
+    """Search for emails, API keys, internal IPs, stack traces, etc."""
+    results = []
+    r = safe_request(url)
+    if not r or not r.text:
+        return results
+    body = r.text
+
+    # Emails
+    emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", body))
+    emails = [e for e in emails if not e.endswith((".png", ".jpg", ".gif", ".css", ".js"))][:8]
+    if emails:
+        results.append({
+            "name": "Email Addresses Disclosed",
+            "severity": "low",
+            "detail": f"تم العثور على {len(emails)} إيميل في الصفحة",
+            "evidence": ", ".join(emails[:5])
+        })
+
+    # API keys / tokens patterns
+    key_patterns = [
+        (r"(?i)(api[_-]?key|apikey|api_secret)[\"'\s:=]+([a-zA-Z0-9_\-]{16,})", "API Key"),
+        (r"(?i)(secret[_-]?key|access[_-]?token)[\"'\s:=]+([a-zA-Z0-9_\-]{16,})", "Secret / Token"),
+        (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
+        (r"ghp_[a-zA-Z0-9]{36}", "GitHub Token"),
+        (r"sk_live_[a-zA-Z0-9]{24,}", "Stripe Live Key"),
+    ]
+    for pat, name in key_patterns:
+        found = re.findall(pat, body)
+        if found:
+            results.append({
+                "name": f"Possible {name} Leaked",
+                "severity": "high",
+                "detail": f"تم اكتشاف نمط {name} في الكود المصدري",
+                "evidence": str(found[0])[:80]
+            })
+
+    # Stack traces / debug
+    if re.search(r"(Traceback \(most recent call last\)|Exception in thread|Stack overflow|Fatal error:|PostgreSQL.*ERROR|SQLSTATE\[)", body, re.I):
+        results.append({
+            "name": "Stack Trace / Debug Info",
+            "severity": "medium",
+            "detail": "معلومات خطأ أو Debug ظاهرة في الرد",
+            "evidence": "Stack trace or fatal error detected"
+        })
+
+    # Internal IPs
+    internal_ips = re.findall(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b", body)
+    if internal_ips:
+        results.append({
+            "name": "Internal IP Disclosure",
+            "severity": "low",
+            "detail": f"عناوين IP داخلية ظاهرة: {', '.join(set(internal_ips)[:4])}",
+            "evidence": ", ".join(set(internal_ips)[:5])
+        })
+
+    return results
+
+
+def check_http_methods(url):
+    """Check for dangerous HTTP methods"""
+    results = []
+    dangerous = ["PUT", "DELETE", "TRACE", "CONNECT", "PATCH"]
+    for method in dangerous:
+        try:
+            r = requests.request(method, url, headers=DEFAULT_HEADERS, timeout=6, verify=False, allow_redirects=False)
+            if r is not None and r.status_code < 400:
+                sev = "high" if method in ("PUT", "DELETE") else "medium"
+                results.append({
+                    "name": f"Dangerous Method Enabled: {method}",
+                    "severity": sev,
+                    "detail": f"الطريقة {method} مسموحة (Status {r.status_code})",
+                    "evidence": f"HTTP {method} → {r.status_code}",
+                    "payload": method
+                })
+        except Exception:
+            pass
+    return results
+
+
+def check_directory_listing(url):
+    """Detect directory listing"""
+    results = []
+    candidates = ["/", "/images/", "/uploads/", "/files/", "/static/", "/assets/", "/backup/", "/tmp/", "/data/"]
+    base = normalize_url(url)
+    for path in candidates:
+        target = urljoin(base + "/", path.lstrip("/"))
+        r = safe_request(target)
+        if r and r.status_code == 200 and r.text:
+            text = r.text.lower()
+            if ("index of /" in text or "directory listing for" in text or 
+                ("parent directory" in text and "<a href=" in text and "last modified" in text)):
+                results.append({
+                    "name": "Directory Listing Enabled",
+                    "severity": "medium",
+                    "detail": f"قائمة الملفات مفتوحة على: {path}",
+                    "evidence": target,
+                    "url": target
+                })
+    return results
+
+
+def check_source_maps(url):
+    """Check for exposed source maps"""
+    results = []
+    r = safe_request(url)
+    if not r or not r.text:
+        return results
+    # Find .js files and check for .map
+    js_files = re.findall(r'src=["\']([^"\']+\.js)["\']', r.text, re.I)[:8]
+    base = normalize_url(url)
+    for js in js_files:
+        js_url = urljoin(base + "/", js)
+        map_url = js_url + ".map"
+        mr = safe_request(map_url, allow_redirects=False)
+        if mr and mr.status_code == 200 and ("mappings" in (mr.text or "") or "sources" in (mr.text or "")):
+            results.append({
+                "name": "Source Map Exposed",
+                "severity": "medium",
+                "detail": f"ملف Source Map متاح: {map_url}",
+                "evidence": map_url,
+                "url": map_url
+            })
+    return results
+
+
+def check_csrf(url):
+    """Basic CSRF check - forms without tokens"""
+    results = []
+    r = safe_request(url)
+    if not r or not r.text:
+        return results
+    soup = BeautifulSoup(r.text, "lxml")
+    forms = soup.find_all("form")
+    for i, form in enumerate(forms[:5]):
+        method = (form.get("method") or "get").lower()
+        if method != "post":
+            continue
+        inputs = form.find_all("input")
+        has_token = False
+        for inp in inputs:
+            name = (inp.get("name") or "").lower()
+            if any(t in name for t in ["csrf", "token", "_token", "authenticity", "nonce", "xsrf"]):
+                has_token = True
+                break
+        if not has_token:
+            action = form.get("action") or url
+            results.append({
+                "name": "Possible CSRF (No Token)",
+                "severity": "medium",
+                "detail": f"فورم POST بدون CSRF Token (form #{i+1})",
+                "evidence": f"Action: {action[:80]}",
+                "url": urljoin(url, action)
+            })
+    return results
+
+
 # ====================== EXPLOIT FUNCTIONS ======================
 def exploit_sqli(url, param, payload, method="GET"):
+
     """Attempt basic data extraction on confirmed SQLi"""
     results = {"success": False, "data": [], "messages": []}
     # Try to extract version / user / database name with common techniques
@@ -687,7 +875,7 @@ def index():
 def api_scan():
     data = request.get_json() or {}
     target = data.get("url", "").strip()
-    modules = data.get("modules", ["headers", "paths", "sqli", "xss", "lfi", "redirect", "fingerprint", "ssl"])
+    modules = data.get("modules", ["headers", "paths", "sqli", "xss", "lfi", "redirect", "fingerprint", "ssl", "cors", "info", "methods", "dirlist", "sourcemap", "csrf"])
     
     if not target:
         return jsonify({"error": "URL required"}), 400
@@ -714,8 +902,21 @@ def api_scan():
             all_results.extend(check_lfi(target))
         if "redirect" in modules:
             all_results.extend(check_open_redirect(target))
+        if "cors" in modules:
+            all_results.extend(check_cors(target))
+        if "info" in modules:
+            all_results.extend(check_info_disclosure(target))
+        if "methods" in modules:
+            all_results.extend(check_http_methods(target))
+        if "dirlist" in modules:
+            all_results.extend(check_directory_listing(target))
+        if "sourcemap" in modules:
+            all_results.extend(check_source_maps(target))
+        if "csrf" in modules:
+            all_results.extend(check_csrf(target))
     except Exception as e:
         return jsonify({"error": str(e), "results": all_results}), 500
+
     
     elapsed = round(time.time() - start, 2)
     
@@ -755,12 +956,44 @@ def api_exploit():
     
     if "sql" in vuln_type.lower():
         result = exploit_sqli(url, param, payload, method)
-    elif "lfi" in vuln_type.lower() or "file" in vuln_type.lower():
+    elif "lfi" in vuln_type.lower() or "file" in vuln_type.lower() or "path traversal" in vuln_type.lower():
         result = exploit_lfi(url, param, payload)
+    elif "sensitive path" in vuln_type.lower() or "path:" in vuln_type.lower():
+        # Try to fetch the sensitive file
+        r = safe_request(url)
+        if r and r.status_code == 200 and len(r.text) > 0:
+            result = {
+                "success": True,
+                "messages": [f"تم جلب الملف بنجاح (Status {r.status_code}, حجم {len(r.text)} بايت)"],
+                "data": [r.text[:3000]]
+            }
+        else:
+            result = {"success": False, "messages": ["الملف غير متاح أو فاضي"], "data": []}
+    elif "xss" in vuln_type.lower():
+        result = {
+            "success": True,
+            "messages": [
+                "XSS منعكس مؤكد. استخدم الـ Payload في المتصفح:",
+                f"Payload: {payload}",
+                "جرب تفتح الرابط في المتصفح وشوف إذا ظهر alert"
+            ],
+            "data": [{"payload": payload, "url": url}]
+        }
+    elif "cors" in vuln_type.lower():
+        result = {
+            "success": True,
+            "messages": [
+                "CORS ضعيف. يمكن قراءة الردود من أي Origin.",
+                "استخدم هذا الكود في كونسول أي موقع:",
+                f"fetch('{url}', {{credentials:'include'}}).then(r=>r.text()).then(console.log)"
+            ],
+            "data": []
+        }
     else:
-        result = {"success": False, "messages": ["Exploit module not implemented for this type yet. Use the payload manually."], "data": []}
+        result = {"success": False, "messages": ["مفيش استغلال أوتوماتيك للنوع ده حالياً. استخدم الطلب المخصص."], "data": []}
     
     return jsonify(result)
+
 
 @app.route("/api/raw", methods=["POST"])
 def api_raw():
@@ -991,6 +1224,13 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
           <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="xss" checked class="accent-cyber-accent"> XSS</label>
           <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="lfi" checked class="accent-cyber-accent"> LFI / Path Traversal</label>
           <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="redirect" checked class="accent-cyber-accent"> Open Redirect</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="cors" checked class="accent-cyber-accent"> CORS</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="info" checked class="accent-cyber-accent"> تسريب معلومات</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="methods" checked class="accent-cyber-accent"> HTTP Methods</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="dirlist" checked class="accent-cyber-accent"> Directory Listing</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="sourcemap" checked class="accent-cyber-accent"> Source Maps</label>
+          <label class="flex items-center gap-1.5 cursor-pointer"><input type="checkbox" class="mod" value="csrf" checked class="accent-cyber-accent"> CSRF</label>
+
         </div>
       </div>
     </section>
@@ -1159,7 +1399,9 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
       } else {
         data.results.forEach((r, idx) => {
           const sev = r.severity || 'info';
-          const canExploit = ['critical','high'].includes(sev) && (r.payload || r.param);
+          const canExploit = (['critical','high'].includes(sev) && (r.payload || r.param || r.url)) || 
+                             (sev === 'medium' && (r.payload || (r.url && r.name && r.name.includes('Path'))));
+
           const el = document.createElement('div');
           el.className = `sev-${sev} rounded-lg p-4 border border-cyber-700`;
           el.innerHTML = `
