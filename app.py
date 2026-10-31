@@ -989,10 +989,53 @@ def api_exploit():
             ],
             "data": []
         }
+    elif "trace" in vuln_type.lower() or (payload and payload.upper() == "TRACE"):
+        # Test TRACE method
+        try:
+            r = requests.request("TRACE", url, headers=DEFAULT_HEADERS, timeout=10, verify=False, allow_redirects=False)
+            body_preview = (r.text or "")[:500]
+            if r.status_code == 200 and ("TRACE" in body_preview or "cookie" in body_preview.lower() or len(body_preview) > 20):
+                result = {
+                    "success": True,
+                    "messages": [
+                        f"TRACE شغال (Status {r.status_code})",
+                        "السيرفر بيرجع محتوى الطلب في الرد — ده بيأكد الثغرة.",
+                        "لو في XSS على الموقع، ممكن تستخدم TRACE لسرقة الكوكيز حتى لو HttpOnly."
+                    ],
+                    "data": [body_preview]
+                }
+            else:
+                result = {
+                    "success": False,
+                    "messages": [
+                        f"الرد على TRACE: Status {r.status_code}",
+                        "الطريقة مش بترجع محتوى الطلب بشكل واضح حالياً.",
+                        "بس وجودها في Allow Header لسه يُعتبر سوء إعداد أمني."
+                    ],
+                    "data": [body_preview]
+                }
+        except Exception as e:
+            result = {"success": False, "messages": [f"خطأ أثناء اختبار TRACE: {str(e)}"], "data": []}
+    elif "dangerous method" in vuln_type.lower() or (payload and payload.upper() in ("PUT", "DELETE", "PATCH", "CONNECT", "OPTIONS")):
+        test_method = (payload or "OPTIONS").upper()
+        try:
+            r = requests.request(test_method, url, headers=DEFAULT_HEADERS, timeout=10, verify=False, allow_redirects=False)
+            result = {
+                "success": r.status_code < 400,
+                "messages": [
+                    f"تم إرسال {test_method} → Status {r.status_code}",
+                    f"Allow header: {r.headers.get('Allow', 'غير موجود')}",
+                    "لو Status 200/201/204 تبقى الطريقة شغالة وخطيرة. لو 405/501 تبقى مقفولة."
+                ],
+                "data": [{"status": r.status_code, "allow": r.headers.get("Allow", ""), "body_preview": (r.text or "")[:300]}]
+            }
+        except Exception as e:
+            result = {"success": False, "messages": [f"خطأ: {str(e)}"], "data": []}
     else:
-        result = {"success": False, "messages": ["مفيش استغلال أوتوماتيك للنوع ده حالياً. استخدم الطلب المخصص."], "data": []}
+        result = {"success": False, "messages": ["مفيش استغلال أوتوماتيك للنوع ده حالياً. استخدم الطلب المخصص من تحت."], "data": []}
     
     return jsonify(result)
+
 
 
 @app.route("/api/raw", methods=["POST"])
